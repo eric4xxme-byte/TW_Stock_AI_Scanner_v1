@@ -457,21 +457,77 @@ st.set_page_config(
 
 st.title("📈 台股 AI Scanner v1")
 st.caption("技術面 + 籌碼面 + 風險控管的盤後選股系統")
+@st.cache_data(ttl=3600)
+def get_hot_stocks_by_turnover(limit=30):
+    """
+    自動抓最近市場成交金額較高的股票。
+    先抓最近 10 天資料，找出最新交易日，再依成交金額排序。
+    """
+    today = datetime.today().date()
+    start_date = today - timedelta(days=10)
 
-default_watchlist = "2330,2317,2382,3231,3441,6285,2313,2409,2344,2618"
+    df = finmind_get(
+        dataset="TaiwanStockPrice",
+        start_date=str(start_date),
+        end_date=str(today)
+    )
 
+    if df.empty:
+        return []
+
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+
+    if "Trading_money" not in df.columns:
+        return []
+
+    df["Trading_money"] = pd.to_numeric(df["Trading_money"], errors="coerce").fillna(0)
+
+    latest_date = df["date"].max()
+    latest_df = df[df["date"] == latest_date].copy()
+
+    latest_df = latest_df.sort_values("Trading_money", ascending=False)
+
+    stock_list = latest_df["stock_id"].astype(str).head(limit).tolist()
+
+    return stock_list
 st.sidebar.header("設定")
-watchlist_text = st.sidebar.text_area(
-    "股票清單，用逗號分隔",
-    default_watchlist,
-    height=120
+
+scan_mode = st.sidebar.radio(
+    "掃描模式",
+    ["自選清單", "自動掃描熱門股"],
+    index=0
 )
 
-watchlist = [
-    x.strip()
-    for x in watchlist_text.replace("，", ",").split(",")
-    if x.strip()
-]
+if scan_mode == "自選清單":
+    default_watchlist = "2330,2317,2382,3231,3441,6285,2313,2409,2344,2618"
+
+    watchlist_text = st.sidebar.text_area(
+        "股票清單，用逗號分隔",
+        default_watchlist,
+        height=120
+    )
+
+    watchlist = [
+        x.strip()
+        for x in watchlist_text.replace("，", ",").split(",")
+        if x.strip()
+    ]
+
+else:
+    hot_limit = st.sidebar.slider(
+        "自動掃描熱門股數量",
+        min_value=10,
+        max_value=100,
+        value=30,
+        step=10
+    )
+
+    with st.spinner("正在抓取市場熱門股..."):
+        watchlist = get_hot_stocks_by_turnover(limit=hot_limit)
+
+    st.sidebar.write("本次自動掃描股票數：", len(watchlist))
+    st.sidebar.write(",".join(watchlist[:20]))
 
 if st.sidebar.button("重新分析"):
     st.cache_data.clear()
