@@ -116,11 +116,13 @@ def get_stock_info():
 @st.cache_data(ttl=1800)
 def get_hot_stocks_by_turnover(limit=30):
     """
-    自動抓上市市場成交金額前 N 名。
-    v2.0.1 只修資料來源：
-    1) 優先使用證交所 STOCK_DAY_ALL open_data
-    2) 失敗再用原本 MI_INDEX
-    3) 最後才用備援清單
+    v2.0.2 只修候選股來源，不動後面的籌碼、風險、評分邏輯。
+    來源順序：
+    1) 證交所 OpenAPI：STOCK_DAY_ALL
+    2) 證交所 open_data：STOCK_DAY_ALL
+    3) 證交所 RWD MI_INDEX
+    4) 原本 MI_INDEX
+    5) 備援熱門股清單
     """
     fallback_list = [
         "2330", "2317", "2382", "3231", "3441", "6285", "2313", "2409", "2344", "2618",
@@ -130,86 +132,141 @@ def get_hot_stocks_by_turnover(limit=30):
     ]
 
     headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "text/csv,application/json,text/plain,*/*",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json,text/csv,text/plain,*/*",
+        "Referer": "https://www.twse.com.tw/",
     }
 
-    # 方法一：證交所每日個股成交資料 open_data
-    # 這個資料源通常比 MI_INDEX 更適合拿來做「最新上市成交金額排行」。
-    open_data_urls = [
-        "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=open_data",
-        "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
-    ]
+    def clean_money_series(series):
+        return pd.to_numeric(
+            series.astype(str)
+            .str.replace(",", "", regex=False)
+            .str.replace("--", "0", regex=False)
+            .str.replace("-", "0", regex=False)
+            .str.replace("nan", "0", regex=False)
+            .str.strip(),
+            errors="coerce",
+        ).fillna(0)
 
-    for url in open_data_urls:
+    def pick_columns(df):
+        stock_col = None
+        name_col = None
+        money_col = None
+
+        for col in df.columns:
+            c = str(col).strip().replace("\ufeff", "")
+
+            if stock_col is None and (
+                c in ["證券代號", "Code", "STOCK_SYMBOL", "代號", "stock_id"]
+                or "證券代號" in c
+            ):
+                stock_col = col
+
+            if name_col is None and (
+                c in ["證券名稱", "Name", "NAME", "名稱", "stock_name"]
+                or "證券名稱" in c
+            ):
+                name_col = col
+
+            if money_col is None and (
+                c in ["成交金額", "TradeValue", "TRADE_VALUE", "Trading_money"]
+                or "成交金額" in c
+                or "TradeValue" in c
+            ):
+                money_col = col
+
+        return stock_col, name_col, money_col
+
+    def build_stock_list(df, source_text):
+        if df is None or df.empty:
+            return None
+
+        df = df.copy()
+        df.columns = [str(c).strip().replace("\ufeff", "") for c in df.columns]
+
+        stock_col, name_col, money_col = pick_columns(df)
+        if stock_col is None or money_col is None:
+            return None
+
+        df[stock_col] = df[stock_col].astype(str).str.strip()
+        df = df[df[stock_col].str.match(r"^\d{4}$", na=False)].copy()
+        if df.empty:
+            return None
+
+        df["成交金額數字"] = clean_money_series(df[money_col])
+        df = df[df["成交金額數字"] > 0].copy()
+        if df.empty:
+            return None
+
+        df = df.sort_values("成交金額數字", ascending=False)
+        stock_list = df[stock_col].astype(str).head(limit).tolist()
+
+        if not stock_list:
+            return None
+
+        return {
+            "stocks": stock_list,
+            "source": source_text,
+            "used_fallback": False,
+        }
+
+    # 1) 證交所 OpenAPI：上市個股日成交資訊
+    # 這個端點是最新上市全市場日成交資料，通常最適合做成交金額熱門股排序。
+    try:
+        url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+        response = requests.get(url, headers=headers, timeout=12)
+        if response.status_code == 200 and response.text.strip():
+            data = response.json()
+            market_df = pd.DataFrame(data if isinstance(data, list) else data.get("data", []))
+            result = build_stock_list(market_df, "證交所上市成交金額排行（OpenAPI STOCK_DAY_ALL）")
+            if result:
+                return result
+    except Exception:
+        pass
+
+    # 2) 證交所 open_data：上市個股日成交資訊 CSV
+    try:
+        url = "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=open_data"
+        response = requests.get(url, headers=headers, timeout=12)
+        if response.status_code == 200 and response.text.strip():
+            market_df = pd.read_csv(io.StringIO(response.text))
+            result = build_stock_list(market_df, "證交所上市成交金額排行（STOCK_DAY_ALL open_data）")
+            if result:
+                return result
+    except Exception:
+        pass
+
+    # 3) RWD MI_INDEX：近 15 日內找最近有資料的交易日
+    today = datetime.today().date()
+    for i in range(0, 15):
+        target_date = today - timedelta(days=i)
+        date_str = target_date.strftime("%Y%m%d")
+
+        url = (
+            "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
+            f"?date={date_str}&type=ALLBUT0999&response=json"
+        )
+
         try:
-            response = requests.get(url, headers=headers, timeout=10)
-            if response.status_code != 200 or not response.text.strip():
+            response = requests.get(url, headers=headers, timeout=12)
+            if response.status_code != 200:
                 continue
 
-            content = response.text.strip()
-
-            # openapi.twse.com.tw 可能回 JSON；www.twse.com.tw open_data 通常回 CSV
-            if content.startswith("[") or content.startswith("{"):
-                raw = response.json()
-                market_df = pd.DataFrame(raw if isinstance(raw, list) else raw.get("data", []))
-            else:
-                market_df = pd.read_csv(io.StringIO(content))
-
-            if market_df.empty:
+            data = response.json()
+            rows = data.get("data9", [])
+            fields = data.get("fields9", [])
+            if not rows or not fields:
                 continue
 
-            # 去除欄位空白與 BOM
-            market_df.columns = [str(c).strip().replace("\ufeff", "") for c in market_df.columns]
-
-            stock_col = None
-            name_col = None
-            money_col = None
-
-            for col in market_df.columns:
-                col_text = str(col)
-                if col_text in ["證券代號", "Code", "STOCK_SYMBOL"] or "證券代號" in col_text:
-                    stock_col = col
-                if col_text in ["證券名稱", "Name", "NAME"] or "證券名稱" in col_text:
-                    name_col = col
-                if col_text in ["成交金額", "TradeValue", "TRADE_VALUE"] or "成交金額" in col_text:
-                    money_col = col
-
-            if stock_col is None or money_col is None:
-                continue
-
-            market_df[stock_col] = market_df[stock_col].astype(str).str.strip()
-            market_df = market_df[market_df[stock_col].str.match(r"^\d{4}$", na=False)].copy()
-
-            if market_df.empty:
-                continue
-
-            market_df["成交金額數字"] = (
-                market_df[money_col]
-                .astype(str)
-                .str.replace(",", "", regex=False)
-                .str.replace("--", "0", regex=False)
-                .str.replace("nan", "0", regex=False)
-            )
-            market_df["成交金額數字"] = pd.to_numeric(market_df["成交金額數字"], errors="coerce").fillna(0)
-            market_df = market_df.sort_values("成交金額數字", ascending=False)
-
-            stock_list = market_df[stock_col].astype(str).head(limit).tolist()
-
-            if stock_list:
-                source_name = "證交所上市成交金額排行（STOCK_DAY_ALL）"
-                return {
-                    "stocks": stock_list,
-                    "source": source_name,
-                    "used_fallback": False,
-                }
-
+            col_len = min(len(fields), len(rows[0]))
+            market_df = pd.DataFrame([row[:col_len] for row in rows], columns=fields[:col_len])
+            result = build_stock_list(market_df, f"證交所上市成交金額排行（RWD MI_INDEX）{target_date}")
+            if result:
+                return result
         except Exception:
             continue
 
-    # 方法二：保留原本 MI_INDEX 當備用
-    today = datetime.today().date()
-
+    # 4) 原本 MI_INDEX：保留舊版可用來源
     for i in range(0, 15):
         target_date = today - timedelta(days=i)
         date_str = target_date.strftime("%Y%m%d")
@@ -221,57 +278,24 @@ def get_hot_stocks_by_turnover(limit=30):
 
         try:
             response = requests.get(url, headers=headers, timeout=8)
+            if response.status_code != 200:
+                continue
+
             data = response.json()
-        except Exception:
-            continue
+            rows = data.get("data9", [])
+            fields = data.get("fields9", [])
+            if not rows or not fields:
+                continue
 
-        rows = data.get("data9", [])
-        fields = data.get("fields9", [])
-
-        if not rows or not fields:
-            continue
-
-        try:
             col_len = min(len(fields), len(rows[0]))
-            df = pd.DataFrame([row[:col_len] for row in rows], columns=fields[:col_len])
+            market_df = pd.DataFrame([row[:col_len] for row in rows], columns=fields[:col_len])
+            result = build_stock_list(market_df, f"證交所上市成交金額排行（舊版 MI_INDEX）{target_date}")
+            if result:
+                return result
         except Exception:
             continue
 
-        stock_col = None
-        money_col = None
-
-        for col in df.columns:
-            if "證券代號" in col:
-                stock_col = col
-            if "成交金額" in col:
-                money_col = col
-
-        if stock_col is None or money_col is None:
-            continue
-
-        df[stock_col] = df[stock_col].astype(str).str.strip()
-        df = df[df[stock_col].str.match(r"^\d{4}$", na=False)].copy()
-
-        df["成交金額數字"] = (
-            df[money_col]
-            .astype(str)
-            .str.replace(",", "", regex=False)
-            .str.replace("--", "0", regex=False)
-        )
-
-        df["成交金額數字"] = pd.to_numeric(df["成交金額數字"], errors="coerce").fillna(0)
-        df = df.sort_values("成交金額數字", ascending=False)
-
-        stock_list = df[stock_col].astype(str).head(limit).tolist()
-
-        if stock_list:
-            return {
-                "stocks": stock_list,
-                "source": f"證交所上市成交金額排行（MI_INDEX） {target_date}",
-                "used_fallback": False,
-            }
-
-    # 最後才走備援
+    # 5) 最後才走備援，讓系統不會空白
     return {
         "stocks": fallback_list[:limit],
         "source": "備援熱門股清單",
