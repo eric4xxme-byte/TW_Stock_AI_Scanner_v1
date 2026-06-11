@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
+import time
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -23,16 +24,39 @@ def finmind_get(dataset, data_id=None, start_date=None, end_date=None):
     if end_date:
         params["end_date"] = end_date
 
-    headers = {}
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
     if FINMIND_TOKEN:
+        params["token"] = FINMIND_TOKEN
         headers["Authorization"] = f"Bearer {FINMIND_TOKEN}"
 
-    try:
-        response = requests.get(API_URL, params=params, headers=headers, timeout=30)
-        data = response.json()
-        return pd.DataFrame(data.get("data", []))
-    except Exception:
-        return pd.DataFrame()
+    for attempt in range(3):
+        try:
+            response = requests.get(
+                API_URL,
+                params=params,
+                headers=headers,
+                timeout=30
+            )
+
+            if response.status_code != 200:
+                time.sleep(1)
+                continue
+
+            data = response.json()
+            df = pd.DataFrame(data.get("data", []))
+
+            if not df.empty:
+                return df
+
+            time.sleep(1)
+
+        except Exception:
+            time.sleep(1.5)
+
+    return pd.DataFrame()
 
 
 def add_indicators(df):
@@ -349,7 +373,7 @@ def analyze_stocks(watchlist):
         )
 
         results.append(base)
-
+time.sleep(0.3)
     result_df = pd.DataFrame(results)
 
     if result_df.empty:
@@ -587,7 +611,11 @@ if st.sidebar.button("重新分析"):
 
 with st.spinner("分析中，請稍候..."):
     df = analyze_stocks(watchlist)
+st.sidebar.write("送出候選股數：", len(watchlist))
+st.sidebar.write("成功分析股票數：", len(df))
 
+if len(df) < len(watchlist):
+    st.sidebar.warning(f"{len(watchlist) - len(df)} 檔因資料不足、API限制或抓取失敗被略過")
 if df.empty:
     st.warning("目前沒有分析結果，請確認股票代號或稍後再試。")
     st.stop()
