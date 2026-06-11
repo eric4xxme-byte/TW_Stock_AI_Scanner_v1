@@ -611,7 +611,7 @@ def make_chart(stock_id):
         template="plotly_white",
         margin=dict(l=20, r=20, t=60, b=20),
     )
-    
+
     return fig
 
 
