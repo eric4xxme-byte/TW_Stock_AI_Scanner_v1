@@ -15,7 +15,7 @@ from plotly.subplots import make_subplots
 # Page config
 # =========================
 st.set_page_config(
-    page_title="台股 AI Scanner v1",
+    page_title="台股 AI Scanner v2.0 Fast + Risk",
     page_icon="📈",
     layout="wide",
 )
@@ -713,7 +713,7 @@ def make_judgement(row):
 # =========================
 # Streamlit UI
 # =========================
-st.title("📈 台股 AI Scanner v1")
+st.title("📈 台股 AI Scanner v2.0 Fast + Risk")
 st.caption("技術面 + 籌碼面 + 風險控管的盤後選股系統")
 
 st.sidebar.header("設定")
@@ -838,6 +838,61 @@ show_cols = [
 
 available_cols = [col for col in show_cols if col in df.columns]
 st.dataframe(df[available_cols], use_container_width=True, hide_index=True)
+
+st.divider()
+
+st.subheader("高風險不要追")
+st.caption("這裡不是做空建議，而是提醒：分數看起來不錯也可能有追高、倒貨或籌碼轉弱風險。")
+
+risk_df = df.copy()
+
+risk_score_series = pd.to_numeric(risk_df.get("風險分", 0), errors="coerce").fillna(0)
+technical_risk_series = risk_df.get("技術風險", "").astype(str)
+chip_risk_series = risk_df.get("籌碼風險", "").astype(str)
+margin_series = pd.to_numeric(risk_df.get("融資變化", 0), errors="coerce").fillna(0)
+foreign_1d_series = pd.to_numeric(risk_df.get("法人單日買賣超", 0), errors="coerce").fillna(0)
+foreign_3d_series = pd.to_numeric(risk_df.get("法人近3日買賣超", 0), errors="coerce").fillna(0)
+
+risk_mask = (
+    (risk_score_series >= 40)
+    | (technical_risk_series != "暫無明顯高風險訊號")
+    | chip_risk_series.str.contains("法人單日賣超|法人近3日合計賣超|融資大增|融資增加|融券回補", na=False)
+    | (margin_series > 1000)
+    | (foreign_1d_series < 0)
+    | (foreign_3d_series < 0)
+)
+
+risk_view = risk_df[risk_mask].copy()
+
+if risk_view.empty:
+    st.success("目前掃描清單內沒有明顯高風險不要追標的。")
+else:
+    risk_view["風險排序"] = pd.to_numeric(risk_view["風險分"], errors="coerce").fillna(0)
+    risk_view = risk_view.sort_values(["風險排序", "AI總分"], ascending=[False, False]).head(15)
+
+    risk_cols = [
+        "日期",
+        "代號",
+        "名稱",
+        "產業",
+        "收盤價",
+        "AI總分",
+        "技術分",
+        "籌碼分",
+        "風險分",
+        "量比",
+        "法人單日買賣超",
+        "法人近3日買賣超",
+        "融資變化",
+        "籌碼狀態",
+        "技術風險",
+        "籌碼風險",
+        "AI進場判斷",
+    ]
+    risk_cols = [col for col in risk_cols if col in risk_view.columns]
+
+    st.dataframe(risk_view[risk_cols], use_container_width=True, hide_index=True)
+
 
 st.divider()
 
