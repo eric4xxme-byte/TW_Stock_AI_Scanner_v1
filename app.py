@@ -1,4 +1,5 @@
 
+import io
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -115,8 +116,11 @@ def get_stock_info():
 @st.cache_data(ttl=1800)
 def get_hot_stocks_by_turnover(limit=30):
     """
-    自動抓上市市場最近交易日成交金額前 N 名。
-    如果證交所資料抓不到，會回傳一組較長的備援清單，避免畫面空白。
+    自動抓上市市場成交金額前 N 名。
+    v2.0.1 只修資料來源：
+    1) 優先使用證交所 STOCK_DAY_ALL open_data
+    2) 失敗再用原本 MI_INDEX
+    3) 最後才用備援清單
     """
     fallback_list = [
         "2330", "2317", "2382", "3231", "3441", "6285", "2313", "2409", "2344", "2618",
@@ -125,8 +129,86 @@ def get_hot_stocks_by_turnover(limit=30):
         "2327", "2308", "2368", "3034", "2357", "2605", "2885", "1101", "1216", "2002"
     ]
 
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "text/csv,application/json,text/plain,*/*",
+    }
+
+    # 方法一：證交所每日個股成交資料 open_data
+    # 這個資料源通常比 MI_INDEX 更適合拿來做「最新上市成交金額排行」。
+    open_data_urls = [
+        "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=open_data",
+        "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
+    ]
+
+    for url in open_data_urls:
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            if response.status_code != 200 or not response.text.strip():
+                continue
+
+            content = response.text.strip()
+
+            # openapi.twse.com.tw 可能回 JSON；www.twse.com.tw open_data 通常回 CSV
+            if content.startswith("[") or content.startswith("{"):
+                raw = response.json()
+                market_df = pd.DataFrame(raw if isinstance(raw, list) else raw.get("data", []))
+            else:
+                market_df = pd.read_csv(io.StringIO(content))
+
+            if market_df.empty:
+                continue
+
+            # 去除欄位空白與 BOM
+            market_df.columns = [str(c).strip().replace("\ufeff", "") for c in market_df.columns]
+
+            stock_col = None
+            name_col = None
+            money_col = None
+
+            for col in market_df.columns:
+                col_text = str(col)
+                if col_text in ["證券代號", "Code", "STOCK_SYMBOL"] or "證券代號" in col_text:
+                    stock_col = col
+                if col_text in ["證券名稱", "Name", "NAME"] or "證券名稱" in col_text:
+                    name_col = col
+                if col_text in ["成交金額", "TradeValue", "TRADE_VALUE"] or "成交金額" in col_text:
+                    money_col = col
+
+            if stock_col is None or money_col is None:
+                continue
+
+            market_df[stock_col] = market_df[stock_col].astype(str).str.strip()
+            market_df = market_df[market_df[stock_col].str.match(r"^\d{4}$", na=False)].copy()
+
+            if market_df.empty:
+                continue
+
+            market_df["成交金額數字"] = (
+                market_df[money_col]
+                .astype(str)
+                .str.replace(",", "", regex=False)
+                .str.replace("--", "0", regex=False)
+                .str.replace("nan", "0", regex=False)
+            )
+            market_df["成交金額數字"] = pd.to_numeric(market_df["成交金額數字"], errors="coerce").fillna(0)
+            market_df = market_df.sort_values("成交金額數字", ascending=False)
+
+            stock_list = market_df[stock_col].astype(str).head(limit).tolist()
+
+            if stock_list:
+                source_name = "證交所上市成交金額排行（STOCK_DAY_ALL）"
+                return {
+                    "stocks": stock_list,
+                    "source": source_name,
+                    "used_fallback": False,
+                }
+
+        except Exception:
+            continue
+
+    # 方法二：保留原本 MI_INDEX 當備用
     today = datetime.today().date()
-    headers = {"User-Agent": "Mozilla/5.0"}
 
     for i in range(0, 15):
         target_date = today - timedelta(days=i)
@@ -185,10 +267,11 @@ def get_hot_stocks_by_turnover(limit=30):
         if stock_list:
             return {
                 "stocks": stock_list,
-                "source": f"證交所成交金額排行 {target_date}",
+                "source": f"證交所上市成交金額排行（MI_INDEX） {target_date}",
                 "used_fallback": False,
             }
 
+    # 最後才走備援
     return {
         "stocks": fallback_list[:limit],
         "source": "備援熱門股清單",
