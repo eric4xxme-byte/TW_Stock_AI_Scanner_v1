@@ -460,37 +460,90 @@ st.caption("技術面 + 籌碼面 + 風險控管的盤後選股系統")
 @st.cache_data(ttl=3600)
 def get_hot_stocks_by_turnover(limit=30):
     """
-    自動抓最近市場成交金額較高的股票。
-    先抓最近 10 天資料，找出最新交易日，再依成交金額排序。
+    自動抓上市市場最近交易日成交金額前 N 名。
+    使用證交所 MI_INDEX 盤後資料。
     """
+
+    fallback_list = [
+        "2330", "2317", "2382", "3231", "3441",
+        "6285", "2313", "2409", "2344", "2618"
+    ]
+
     today = datetime.today().date()
-    start_date = today - timedelta(days=10)
 
-    df = finmind_get(
-        dataset="TaiwanStockPrice",
-        start_date=str(start_date),
-        end_date=str(today)
-    )
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
 
-    if df.empty:
-        return []
+    # 往前找最近 15 天，避開假日與尚未更新的日期
+    for i in range(0, 15):
+        target_date = today - timedelta(days=i)
+        date_str = target_date.strftime("%Y%m%d")
 
-    df = df.copy()
-    df["date"] = pd.to_datetime(df["date"])
+        url = (
+            "https://www.twse.com.tw/exchangeReport/MI_INDEX"
+            f"?response=json&date={date_str}&type=ALLBUT0999"
+        )
 
-    if "Trading_money" not in df.columns:
-        return []
+        try:
+            response = requests.get(url, headers=headers, timeout=20)
+            data = response.json()
+        except Exception:
+            continue
 
-    df["Trading_money"] = pd.to_numeric(df["Trading_money"], errors="coerce").fillna(0)
+        rows = data.get("data9", [])
+        fields = data.get("fields9", [])
 
-    latest_date = df["date"].max()
-    latest_df = df[df["date"] == latest_date].copy()
+        if not rows or not fields:
+            continue
 
-    latest_df = latest_df.sort_values("Trading_money", ascending=False)
+        try:
+            col_len = min(len(fields), len(rows[0]))
+            df = pd.DataFrame(
+                [row[:col_len] for row in rows],
+                columns=fields[:col_len]
+            )
+        except Exception:
+            continue
 
-    stock_list = latest_df["stock_id"].astype(str).head(limit).tolist()
+        stock_col = None
+        money_col = None
 
-    return stock_list
+        for col in df.columns:
+            if "證券代號" in col:
+                stock_col = col
+            if "成交金額" in col:
+                money_col = col
+
+        if stock_col is None or money_col is None:
+            continue
+
+        df[stock_col] = df[stock_col].astype(str).str.strip()
+
+        # 只保留四碼股票，排除 ETF / 權證 / 特殊商品
+        df = df[df[stock_col].str.match(r"^\d{4}$", na=False)].copy()
+
+        df["成交金額數字"] = (
+            df[money_col]
+            .astype(str)
+            .str.replace(",", "", regex=False)
+            .str.replace("--", "0", regex=False)
+        )
+
+        df["成交金額數字"] = pd.to_numeric(
+            df["成交金額數字"],
+            errors="coerce"
+        ).fillna(0)
+
+        df = df.sort_values("成交金額數字", ascending=False)
+
+        stock_list = df[stock_col].astype(str).head(limit).tolist()
+
+        if stock_list:
+            return stock_list
+
+    # 如果證交所資料也抓不到，就至少回傳預設清單，避免畫面空白
+    return fallback_list[:limit]
 st.sidebar.header("設定")
 
 scan_mode = st.sidebar.radio(
