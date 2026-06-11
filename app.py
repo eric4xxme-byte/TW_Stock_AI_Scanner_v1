@@ -199,15 +199,25 @@ def get_hot_stocks_by_turnover(limit=30):
             return None
 
         df = df.sort_values("成交金額數字", ascending=False)
-        stock_list = df[stock_col].astype(str).head(limit).tolist()
+        top_df = df.head(limit).copy()
+        stock_list = top_df[stock_col].astype(str).tolist()
 
         if not stock_list:
             return None
+
+        name_map = {}
+        if name_col is not None and name_col in top_df.columns:
+            name_map = {
+                str(code).strip(): str(name).strip()
+                for code, name in zip(top_df[stock_col], top_df[name_col])
+                if str(code).strip() and str(name).strip() and str(name).strip().lower() != "nan"
+            }
 
         return {
             "stocks": stock_list,
             "source": source_text,
             "used_fallback": False,
+            "name_map": name_map,
         }
 
     # 1) 證交所 OpenAPI：上市個股日成交資訊
@@ -296,10 +306,21 @@ def get_hot_stocks_by_turnover(limit=30):
             continue
 
     # 5) 最後才走備援，讓系統不會空白
+    fallback_name_map = {
+        "2330": "台積電", "2317": "鴻海", "2382": "廣達", "3231": "緯創", "3441": "聯一光",
+        "6285": "啟碁", "2313": "華通", "2409": "友達", "2344": "華邦電", "2618": "長榮航",
+        "2303": "聯電", "2454": "聯發科", "2603": "長榮", "2609": "陽明", "2615": "萬海",
+        "3706": "神達", "3661": "世芯-KY", "3017": "奇鋐", "3037": "欣興", "2881": "富邦金",
+        "2882": "國泰金", "2883": "凱基金", "2884": "玉山金", "2891": "中信金", "2892": "第一金",
+        "2356": "英業達", "2379": "瑞昱", "2345": "智邦", "4938": "和碩", "3711": "日月光投控",
+        "2327": "國巨", "2308": "台達電", "2368": "金像電", "3034": "聯詠", "2357": "華碩",
+        "2605": "新興", "2885": "元大金", "1101": "台泥", "1216": "統一", "2002": "中鋼"
+    }
     return {
         "stocks": fallback_list[:limit],
         "source": "備援熱門股清單",
         "used_fallback": True,
+        "name_map": fallback_name_map,
     }
 
 
@@ -617,7 +638,7 @@ def enrich_chip_for_row(row, start_date, end_date):
 
 
 @st.cache_data(ttl=1800)
-def analyze_stocks(watchlist, chip_detail_count=10):
+def analyze_stocks(watchlist, chip_detail_count=10, source_name_map=None):
     """
     加速版：
     1. 先平行抓股價，算技術分與風險分。
@@ -639,6 +660,7 @@ def analyze_stocks(watchlist, chip_detail_count=10):
     watchlist = cleaned_watchlist
 
     stock_info = get_stock_info()
+    source_name_map = source_name_map or {}
     results = []
 
     max_workers = min(10, max(1, len(watchlist)))
@@ -664,6 +686,8 @@ def analyze_stocks(watchlist, chip_detail_count=10):
 
     result_df["代號"] = result_df["代號"].astype(str)
 
+    source_names = result_df["代號"].map(source_name_map)
+
     if not stock_info.empty:
         result_df = result_df.merge(
             stock_info,
@@ -671,10 +695,11 @@ def analyze_stocks(watchlist, chip_detail_count=10):
             right_on="stock_id",
             how="left",
         )
-        result_df["名稱"] = result_df["stock_name"].fillna(result_df["代號"])
+        source_names = result_df["代號"].map(source_name_map)
+        result_df["名稱"] = result_df["stock_name"].fillna(source_names).fillna(result_df["代號"])
         result_df["產業"] = result_df["industry_category"].fillna("未知")
     else:
-        result_df["名稱"] = result_df["代號"]
+        result_df["名稱"] = source_names.fillna(result_df["代號"])
         result_df["產業"] = "未知"
 
     result_df = result_df.sort_values("初步分數", ascending=False).reset_index(drop=True)
@@ -847,6 +872,7 @@ if scan_mode == "自選清單":
     ]
 
     source_text = "自選清單"
+    source_name_map = {}
 
 else:
     hot_limit = st.sidebar.slider(
@@ -860,9 +886,11 @@ else:
     hot_result = get_hot_stocks_by_turnover(limit=hot_limit)
     watchlist = hot_result["stocks"]
     source_text = hot_result["source"]
+    source_name_map = hot_result.get("name_map", {})
 
     st.sidebar.write("候選股來源：", source_text)
     st.sidebar.write("本次自動掃描候選股數：", len(watchlist))
+    st.sidebar.write("候選股名稱對應數：", len(source_name_map))
     st.sidebar.caption(",".join(watchlist[:50]))
 
 chip_detail_count = st.sidebar.slider(
@@ -879,7 +907,11 @@ if st.sidebar.button("重新分析"):
     st.rerun()
 
 with st.spinner("分析中，請稍候..."):
-    df = analyze_stocks(watchlist, chip_detail_count=chip_detail_count)
+    df = analyze_stocks(
+        watchlist,
+        chip_detail_count=chip_detail_count,
+        source_name_map=source_name_map,
+    )
 
 if df.empty:
     st.warning("目前沒有分析結果，請確認股票代號或稍後再試。")
